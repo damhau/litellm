@@ -2,37 +2,21 @@ model_list:
   - model_name: claude-sonnet-4-20250514
     litellm_params:
       model: anthropic/claude-sonnet-4-20250514
-      api_key: os.environ/ANTHROPIC_API_KEY
 
 guardrails:
-  - guardrail_name: "test-content-filter"
-    litellm_params:
-      guardrail: litellm_content_filter
-      mode: pre_call
-      default_on: true
-      blocked_words:
-        - keyword: "bomb"
-          action: BLOCK
-          description: "Dangerous content"
-        - keyword: "hack"
-          action: BLOCK
-          description: "Hacking content"
-        - keyword: "password123"
-          action: MASK
-          description: "Sensitive data"
-
-  - guardrail_name: "block-bash-tool"
+  - guardrail_name: "control-bash-commands"
     litellm_params:
       guardrail: tool_permission
-      mode: pre_call
+      mode: post_call
       default_on: true
       default_action: "allow"
       on_disallowed_action: "block"
-      violation_message_template: "Tool '{tool_name}' is not permitted by guardrail policy"
       rules:
-        - id: "deny_bash"
+        - id: "block_docker_push"
           tool_name: "^Bash$"
           decision: "deny"
+          allowed_param_patterns:
+            command: ".*\\bdocker\\s+push\\b.*"
 
 general_settings:
   master_key: sk-test-master-key

@@ -820,3 +820,390 @@ class TestToolPermissionGuardrailIntegration:
         is_allowed, rule_id, _ = guardrail._check_tool_permission("Read")
         assert is_allowed is False
         assert rule_id == "deny_read"
+
+
+# ---------------------------------------------------------------------------
+# Streaming hook tests (Anthropic SSE + OpenAI format)
+# ---------------------------------------------------------------------------
+
+def _make_anthropic_sse_tool_use_chunks(
+    tool_name: str,
+    tool_id: str,
+    arguments_json: str,
+    block_index: int = 0,
+) -> list:
+    """Build a list of raw SSE byte chunks mimicking Anthropic streaming."""
+    # Split arguments into two fragments to test accumulation
+    mid = len(arguments_json) // 2
+    frag1 = arguments_json[:mid]
+    frag2 = arguments_json[mid:]
+
+    import json as _json
+
+    chunks = [
+        # message_start (harmless, should be skipped)
+        b'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-20250514","stop_reason":null}}\n\n',
+        # content_block_start with tool_use
+        (
+            'event: content_block_start\n'
+            'data: ' + _json.dumps({
+                "type": "content_block_start",
+                "index": block_index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": tool_id,
+                    "name": tool_name,
+                    "input": {},
+                },
+            }) + '\n\n'
+        ).encode(),
+        # input_json_delta fragment 1
+        (
+            'event: content_block_delta\n'
+            'data: ' + _json.dumps({
+                "type": "content_block_delta",
+                "index": block_index,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": frag1,
+                },
+            }) + '\n\n'
+        ).encode(),
+        # input_json_delta fragment 2
+        (
+            'event: content_block_delta\n'
+            'data: ' + _json.dumps({
+                "type": "content_block_delta",
+                "index": block_index,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": frag2,
+                },
+            }) + '\n\n'
+        ).encode(),
+        # content_block_stop
+        (
+            'event: content_block_stop\n'
+            'data: ' + _json.dumps({
+                "type": "content_block_stop",
+                "index": block_index,
+            }) + '\n\n'
+        ).encode(),
+        # message_delta + message_stop
+        b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}\n\n',
+        b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ]
+    return chunks
+
+
+async def _async_iter(items):
+    """Wrap a list as an async iterator."""
+    for item in items:
+        yield item
+
+
+class TestStreamingHookAnthropicSSE:
+    """Tests for async_post_call_streaming_iterator_hook with Anthropic SSE bytes."""
+
+    @pytest.mark.asyncio
+    async def test_streaming_hook_with_anthropic_sse_tool_use_blocked(self):
+        """SSE bytes with tool_use that is denied → raises GuardrailRaisedException."""
+        guardrail = ToolPermissionGuardrail(
+            guardrail_name="block-read",
+            rules=[
+                {"id": "deny_read", "tool_name": r"^Read$", "decision": "deny"},
+            ],
+            default_action="allow",
+            on_disallowed_action="block",
+        )
+
+        chunks = _make_anthropic_sse_tool_use_chunks(
+            tool_name="Read",
+            tool_id="toolu_abc",
+            arguments_json='{"file_path": "/etc/passwd"}',
+        )
+
+        with pytest.raises(GuardrailRaisedException):
+            collected = []
+            async for c in guardrail.async_post_call_streaming_iterator_hook(
+                user_api_key_dict=UserAPIKeyAuth(),
+                response=_async_iter(chunks),
+                request_data={},
+            ):
+                collected.append(c)
+
+    @pytest.mark.asyncio
+    async def test_streaming_hook_with_anthropic_sse_tool_use_allowed(self):
+        """SSE bytes with tool_use that is allowed → yields all original chunks."""
+        guardrail = ToolPermissionGuardrail(
+            guardrail_name="allow-bash",
+            rules=[
+                {"id": "allow_bash", "tool_name": r"^Bash$", "decision": "allow"},
+            ],
+            default_action="deny",
+            on_disallowed_action="block",
+        )
+
+        chunks = _make_anthropic_sse_tool_use_chunks(
+            tool_name="Bash",
+            tool_id="toolu_bash1",
+            arguments_json='{"command": "docker build ."}',
+        )
+
+        collected = []
+        async for c in guardrail.async_post_call_streaming_iterator_hook(
+            user_api_key_dict=UserAPIKeyAuth(),
+            response=_async_iter(chunks),
+            request_data={},
+        ):
+            collected.append(c)
+
+        # All original chunks should be yielded back
+        assert len(collected) == len(chunks)
+        # Verify they are the exact same bytes
+        for orig, got in zip(chunks, collected):
+            assert orig == got
+
+    @pytest.mark.asyncio
+    async def test_streaming_hook_with_anthropic_sse_allowed_param_patterns(self):
+        """SSE bytes, Bash tool with command arg — regex blocks ssh but allows docker build."""
+        guardrail = ToolPermissionGuardrail(
+            guardrail_name="param-pattern-guard",
+            rules=[
+                {
+                    "id": "allow_bash_no_ssh",
+                    "tool_name": r"^Bash$",
+                    "decision": "allow",
+                    "allowed_param_patterns": {
+                        "command": r"^(?!.*\bssh\b).*$",
+                    },
+                },
+            ],
+            default_action="deny",
+            on_disallowed_action="block",
+        )
+
+        # Allowed: docker build
+        docker_chunks = _make_anthropic_sse_tool_use_chunks(
+            tool_name="Bash",
+            tool_id="toolu_docker",
+            arguments_json='{"command": "docker build ."}',
+        )
+
+        collected = []
+        async for c in guardrail.async_post_call_streaming_iterator_hook(
+            user_api_key_dict=UserAPIKeyAuth(),
+            response=_async_iter(docker_chunks),
+            request_data={},
+        ):
+            collected.append(c)
+        assert len(collected) == len(docker_chunks)
+
+        # Blocked: ssh
+        ssh_chunks = _make_anthropic_sse_tool_use_chunks(
+            tool_name="Bash",
+            tool_id="toolu_ssh",
+            arguments_json='{"command": "ssh user@host"}',
+        )
+
+        with pytest.raises(GuardrailRaisedException):
+            async for c in guardrail.async_post_call_streaming_iterator_hook(
+                user_api_key_dict=UserAPIKeyAuth(),
+                response=_async_iter(ssh_chunks),
+                request_data={},
+            ):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_streaming_hook_with_anthropic_sse_no_tool_use(self):
+        """SSE bytes without any tool_use events → pass through."""
+        guardrail = ToolPermissionGuardrail(
+            guardrail_name="block-all",
+            rules=[],
+            default_action="deny",
+            on_disallowed_action="block",
+        )
+
+        chunks = [
+            b'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","role":"assistant","content":[],"model":"claude-sonnet-4-20250514"}}\n\n',
+            b'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+            b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello!"}}\n\n',
+            b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ]
+
+        collected = []
+        async for c in guardrail.async_post_call_streaming_iterator_hook(
+            user_api_key_dict=UserAPIKeyAuth(),
+            response=_async_iter(chunks),
+            request_data={},
+        ):
+            collected.append(c)
+
+        assert len(collected) == len(chunks)
+
+
+class TestStreamingHookOpenAIFormat:
+    """Tests for async_post_call_streaming_iterator_hook with OpenAI ModelResponseStream."""
+
+    @pytest.mark.asyncio
+    async def test_streaming_hook_with_openai_format_still_works(self):
+        """OpenAI-format ModelResponseStream chunks with a denied tool → raises."""
+        from litellm.types.utils import (
+            ChatCompletionDeltaToolCall,
+            Delta,
+            Function,
+            ModelResponseStream,
+            StreamingChoices,
+        )
+
+        guardrail = ToolPermissionGuardrail(
+            guardrail_name="block-read",
+            rules=[
+                {"id": "deny_read", "tool_name": r"^Read$", "decision": "deny"},
+            ],
+            default_action="allow",
+            on_disallowed_action="block",
+        )
+
+        # Build streaming chunks with tool_call delta fragments
+        chunk1 = ModelResponseStream(
+            choices=[
+                StreamingChoices(
+                    delta=Delta(
+                        tool_calls=[
+                            ChatCompletionDeltaToolCall(
+                                index=0,
+                                id="call_read1",
+                                function=Function(name="Read", arguments=""),
+                                type="function",
+                            )
+                        ]
+                    )
+                )
+            ]
+        )
+        chunk2 = ModelResponseStream(
+            choices=[
+                StreamingChoices(
+                    delta=Delta(
+                        tool_calls=[
+                            ChatCompletionDeltaToolCall(
+                                index=0,
+                                function=Function(arguments='{"file": "x"}'),
+                            )
+                        ]
+                    )
+                )
+            ]
+        )
+        chunk3 = ModelResponseStream(
+            choices=[StreamingChoices(finish_reason="tool_calls", delta=Delta())]
+        )
+
+        with pytest.raises(GuardrailRaisedException):
+            async for _ in guardrail.async_post_call_streaming_iterator_hook(
+                user_api_key_dict=UserAPIKeyAuth(),
+                response=_async_iter([chunk1, chunk2, chunk3]),
+                request_data={},
+            ):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_streaming_hook_with_openai_format_allowed(self):
+        """OpenAI-format ModelResponseStream chunks with an allowed tool → yields chunks."""
+        from litellm.types.utils import (
+            ChatCompletionDeltaToolCall,
+            Delta,
+            Function,
+            ModelResponseStream,
+            StreamingChoices,
+        )
+
+        guardrail = ToolPermissionGuardrail(
+            guardrail_name="allow-bash",
+            rules=[
+                {"id": "allow_bash", "tool_name": r"^Bash$", "decision": "allow"},
+            ],
+            default_action="deny",
+            on_disallowed_action="block",
+        )
+
+        chunk1 = ModelResponseStream(
+            choices=[
+                StreamingChoices(
+                    delta=Delta(
+                        tool_calls=[
+                            ChatCompletionDeltaToolCall(
+                                index=0,
+                                id="call_bash1",
+                                function=Function(name="Bash", arguments='{"cmd":'),
+                                type="function",
+                            )
+                        ]
+                    )
+                )
+            ]
+        )
+        chunk2 = ModelResponseStream(
+            choices=[
+                StreamingChoices(
+                    delta=Delta(
+                        tool_calls=[
+                            ChatCompletionDeltaToolCall(
+                                index=0,
+                                function=Function(arguments='"ls"}'),
+                            )
+                        ]
+                    )
+                )
+            ]
+        )
+        chunk3 = ModelResponseStream(
+            choices=[StreamingChoices(finish_reason="tool_calls", delta=Delta())]
+        )
+
+        original = [chunk1, chunk2, chunk3]
+        collected = []
+        async for c in guardrail.async_post_call_streaming_iterator_hook(
+            user_api_key_dict=UserAPIKeyAuth(),
+            response=_async_iter(original),
+            request_data={},
+        ):
+            collected.append(c)
+
+        assert len(collected) == len(original)
+
+    @pytest.mark.asyncio
+    async def test_streaming_hook_with_openai_no_tool_calls(self):
+        """OpenAI-format chunks without tool_calls → pass through."""
+        from litellm.types.utils import (
+            Delta,
+            ModelResponseStream,
+            StreamingChoices,
+        )
+
+        guardrail = ToolPermissionGuardrail(
+            guardrail_name="block-all",
+            rules=[],
+            default_action="deny",
+            on_disallowed_action="block",
+        )
+
+        chunk1 = ModelResponseStream(
+            choices=[StreamingChoices(delta=Delta(content="Hello"))]
+        )
+        chunk2 = ModelResponseStream(
+            choices=[StreamingChoices(finish_reason="stop", delta=Delta())]
+        )
+
+        original = [chunk1, chunk2]
+        collected = []
+        async for c in guardrail.async_post_call_streaming_iterator_hook(
+            user_api_key_dict=UserAPIKeyAuth(),
+            response=_async_iter(original),
+            request_data={},
+        ):
+            collected.append(c)
+
+        assert len(collected) == len(original)

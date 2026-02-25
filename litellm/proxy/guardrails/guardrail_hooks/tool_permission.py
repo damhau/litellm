@@ -648,6 +648,179 @@ class ToolPermissionGuardrail(CustomGuardrail):
         )
         return response
 
+    @staticmethod
+    def _extract_tool_calls_from_anthropic_sse_chunks(
+        chunks: List[Any],
+    ) -> List[ChatCompletionMessageToolCall]:
+        """
+        Parse Anthropic SSE byte/str chunks and extract tool_use blocks.
+
+        Looks for ``content_block_start`` events with ``type: "tool_use"``
+        (provides tool id + name) and ``content_block_delta`` events with
+        ``input_json_delta`` (provides argument fragments).  Accumulates
+        fragments per block index and returns assembled
+        ``ChatCompletionMessageToolCall`` objects.
+        """
+        # Per-block accumulators keyed by content_block index
+        block_names: Dict[int, str] = {}
+        block_ids: Dict[int, str] = {}
+        block_args: Dict[int, str] = {}
+
+        for raw_chunk in chunks:
+            text = raw_chunk.decode("utf-8", errors="replace") if isinstance(raw_chunk, bytes) else str(raw_chunk)
+            for line in text.splitlines():
+                line = line.strip()
+                if not line.startswith("data:"):
+                    continue
+                json_str = line[len("data:"):].strip()
+                if not json_str or json_str == "[DONE]":
+                    continue
+                try:
+                    event = json.loads(json_str)
+                except json.JSONDecodeError:
+                    continue
+
+                event_type = event.get("type")
+                index = event.get("index", 0)
+
+                if event_type == "content_block_start":
+                    cb = event.get("content_block", {})
+                    if cb.get("type") == "tool_use":
+                        block_names[index] = cb.get("name", "")
+                        block_ids[index] = cb.get("id", "")
+                        block_args.setdefault(index, "")
+
+                elif event_type == "content_block_delta":
+                    delta = event.get("delta", {})
+                    if delta.get("type") == "input_json_delta":
+                        partial = delta.get("partial_json", "")
+                        block_args[index] = block_args.get(index, "") + partial
+
+        tool_calls: List[ChatCompletionMessageToolCall] = []
+        for idx in sorted(block_names):
+            tool_calls.append(
+                ChatCompletionMessageToolCall(
+                    id=block_ids.get(idx, f"toolu_{idx}"),
+                    function={
+                        "name": block_names[idx],
+                        "arguments": block_args.get(idx, ""),
+                    },
+                    type="function",
+                )
+            )
+        return tool_calls
+
+    @staticmethod
+    def _extract_tool_calls_from_openai_stream_chunks(
+        chunks: List[ModelResponseStream],
+    ) -> List[ChatCompletionMessageToolCall]:
+        """
+        Iterate OpenAI-format ``ModelResponseStream`` chunks and accumulate
+        ``delta.tool_calls`` fragments into complete
+        ``ChatCompletionMessageToolCall`` objects.
+        """
+        # Accumulators keyed by tool_call index
+        tc_ids: Dict[int, str] = {}
+        tc_names: Dict[int, str] = {}
+        tc_args: Dict[int, str] = {}
+
+        for chunk in chunks:
+            if not hasattr(chunk, "choices") or not chunk.choices:
+                continue
+            delta = getattr(chunk.choices[0], "delta", None)
+            if delta is None:
+                continue
+            delta_tool_calls = getattr(delta, "tool_calls", None)
+            if not delta_tool_calls:
+                continue
+            for dtc in delta_tool_calls:
+                idx = getattr(dtc, "index", 0)
+                tc_id = getattr(dtc, "id", None)
+                if tc_id:
+                    tc_ids[idx] = tc_id
+                func = getattr(dtc, "function", None)
+                if func:
+                    name = getattr(func, "name", None)
+                    if name:
+                        tc_names[idx] = name
+                    args = getattr(func, "arguments", None)
+                    if args:
+                        tc_args[idx] = tc_args.get(idx, "") + args
+
+        tool_calls: List[ChatCompletionMessageToolCall] = []
+        for idx in sorted(tc_names):
+            tool_calls.append(
+                ChatCompletionMessageToolCall(
+                    id=tc_ids.get(idx, f"call_{idx}"),
+                    function={
+                        "name": tc_names[idx],
+                        "arguments": tc_args.get(idx, ""),
+                    },
+                    type="function",
+                )
+            )
+        return tool_calls
+
+    def _check_and_enforce_tool_permissions(
+        self,
+        tool_calls: List[ChatCompletionMessageToolCall],
+        request_data: Optional[dict] = None,
+    ) -> List[tuple]:
+        """
+        Check permissions for a list of tool_calls and either raise on block
+        or return the list of denied (tool_call, PermissionError) tuples for
+        rewrite mode.
+
+        When *request_data* is provided and a block-mode exception is raised,
+        guardrail information is attached to the request metadata so the
+        LiteLLM UI displays the structured guardrail response instead of a
+        raw 500 error.
+        """
+        from datetime import datetime
+
+        start_time = datetime.now()
+        denied_tools: List[tuple] = []
+        for tool_call in tool_calls:
+            is_allowed, rule_id, message = self._get_permission_for_tool_call(
+                tool_call
+            )
+            if not is_allowed and message is not None:
+                verbose_proxy_logger.warning(
+                    f"Tool Permission Guardrail: {message}"
+                )
+                if self.on_disallowed_action == "block":
+                    exc = GuardrailRaisedException(
+                        guardrail_name=self.guardrail_name,
+                        message=message,
+                    )
+                    if request_data is not None:
+                        now = datetime.now()
+                        self.add_standard_logging_guardrail_information_to_request_data(
+                            guardrail_json_response=exc,
+                            request_data=request_data,
+                            guardrail_status="guardrail_intervened",
+                            start_time=start_time.timestamp(),
+                            end_time=now.timestamp(),
+                            duration=(now - start_time).total_seconds(),
+                            event_type=GuardrailEventHooks.post_call,
+                        )
+                    raise exc
+                denied_tools.append(
+                    (
+                        tool_call,
+                        PermissionError(
+                            tool_name=(
+                                tool_call.function.name
+                                if tool_call.function and tool_call.function.name
+                                else "unknown_tool"
+                            ),
+                            rule_id=rule_id,
+                            message=message,
+                        ),
+                    )
+                )
+        return denied_tools
+
     async def async_post_call_streaming_iterator_hook(
         self,
         user_api_key_dict: UserAPIKeyAuth,
@@ -655,94 +828,70 @@ class ToolPermissionGuardrail(CustomGuardrail):
         request_data: dict,
     ) -> AsyncGenerator[ModelResponseStream, None]:
         """
-        Check tool usage permissions after the LLM stream call
+        Check tool usage permissions after the LLM stream call.
 
-        Args:
-            user_api_key_dict: User API key information (unused but required by interface)
-            response: The model response to check
-            request_data: The model request (unused but required by interface)
+        Handles both OpenAI-format chunks (``ModelResponseStream`` objects)
+        and Anthropic SSE format (raw ``bytes``/``str`` chunks).
         """
-
-        # Import here to avoid circular imports
         from litellm.llms.base_llm.base_model_iterator import MockResponseIterator
-        from litellm.main import stream_chunk_builder
-        from litellm.types.utils import TextCompletionResponse
 
-        # Collect all chunks to process them together
-        all_chunks: List[ModelResponseStream] = []
+        # Buffer all chunks
+        all_chunks: List[Any] = []
         async for chunk in response:
             all_chunks.append(chunk)
 
-        assembled_model_response: Optional[
-            Union[ModelResponse, TextCompletionResponse]
-        ] = stream_chunk_builder(
-            chunks=all_chunks,
-        )
-        if isinstance(assembled_model_response, ModelResponse):
-            verbose_proxy_logger.debug("Tool Permission Guardrail: Checking response")
+        if not all_chunks:
+            return
 
-            # Extract tool_calls from the response
-            tool_calls = self._extract_tool_calls_from_response(
-                assembled_model_response
-            )
+        # Detect format: OpenAI (ModelResponseStream / dict) vs Anthropic SSE (bytes / str)
+        first = all_chunks[0]
+        is_anthropic_sse = isinstance(first, (bytes, str))
 
-            if not tool_calls:
-                verbose_proxy_logger.debug(
-                    "Tool Permission Guardrail: No tool uses found"
-                )
-                return
-
-            verbose_proxy_logger.debug(
-                f"Tool Permission Guardrail: Found {len(tool_calls)} tool calls"
-            )
-
-            # Check permissions for each tool use
-            denied_tools = []
-            for tool_call in tool_calls:
-                is_allowed, rule_id, message = self._get_permission_for_tool_call(
-                    tool_call
-                )
-
-                if not is_allowed and message is not None:
-                    verbose_proxy_logger.warning(
-                        f"Tool Permission Guardrail: {message}"
-                    )
-
-                    if self.on_disallowed_action == "block":
-                        raise GuardrailRaisedException(
-                            guardrail_name=self.guardrail_name,
-                            message=message,
-                        )
-                    denied_tools.append(
-                        (
-                            tool_call,
-                            PermissionError(
-                                tool_name=(
-                                    tool_call.function.name
-                                    if tool_call.function and tool_call.function.name
-                                    else "unknown_tool"
-                                ),
-                                rule_id=rule_id,
-                                message=message,
-                            ),
-                        )
-                    )
-
-            if denied_tools:
-                self._modify_response_with_permission_errors(
-                    assembled_model_response, denied_tools
-                )
-            else:
-                verbose_proxy_logger.debug(
-                    "Tool Permission Guardrail Post-Call Hook: All tools allowed"
-                )
-
-            mock_response = MockResponseIterator(
-                model_response=assembled_model_response
-            )
-            # Return the reconstructed stream
-            async for chunk in mock_response:
-                yield chunk
+        if is_anthropic_sse:
+            tool_calls = self._extract_tool_calls_from_anthropic_sse_chunks(all_chunks)
+        elif isinstance(first, (ModelResponseStream, dict)):
+            tool_calls = self._extract_tool_calls_from_openai_stream_chunks(all_chunks)
         else:
+            # Unknown format — pass through
             for chunk in all_chunks:
                 yield chunk
+            return
+
+        if not tool_calls:
+            verbose_proxy_logger.debug(
+                "Tool Permission Guardrail: No tool uses found"
+            )
+            for chunk in all_chunks:
+                yield chunk
+            return
+
+        verbose_proxy_logger.debug(
+            f"Tool Permission Guardrail: Found {len(tool_calls)} tool calls"
+        )
+
+        denied_tools = self._check_and_enforce_tool_permissions(tool_calls, request_data=request_data)
+
+        if denied_tools and not is_anthropic_sse:
+            # Rewrite mode for OpenAI format: reassemble via stream_chunk_builder
+            from litellm.main import stream_chunk_builder
+            from litellm.types.utils import TextCompletionResponse
+
+            assembled: Optional[
+                Union[ModelResponse, TextCompletionResponse]
+            ] = stream_chunk_builder(chunks=all_chunks)
+
+            if isinstance(assembled, ModelResponse):
+                self._modify_response_with_permission_errors(assembled, denied_tools)
+                mock_response = MockResponseIterator(model_response=assembled)
+                async for chunk in mock_response:
+                    yield chunk
+                return
+
+        if not denied_tools:
+            verbose_proxy_logger.debug(
+                "Tool Permission Guardrail Post-Call Hook: All tools allowed"
+            )
+
+        # Yield original buffered chunks (allowed, or anthropic rewrite passthrough)
+        for chunk in all_chunks:
+            yield chunk
