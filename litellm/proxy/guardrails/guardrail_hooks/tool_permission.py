@@ -405,9 +405,14 @@ class ToolPermissionGuardrail(CustomGuardrail):
 
         new_tools = []
         for tool in tools:
-            if tool["type"] != "function":
+            tool_type = tool.get("type")
+            if tool_type == "function":
+                tool_name = tool["function"]["name"]
+            elif "name" in tool:
+                # Anthropic-native tool (e.g. bash_20250124, text_editor_20250124)
+                tool_name = tool["name"]
+            else:
                 continue
-            tool_name: str = tool["function"]["name"]
             if tool_name not in error_tool_names:
                 new_tools.append(tool)
         data["tools"] = new_tools
@@ -514,13 +519,27 @@ class ToolPermissionGuardrail(CustomGuardrail):
             )
             return data
 
+        # Debug: log tool names and types seen by the guardrail
+        for _t in (new_tools or []):
+            _ttype = _t.get("type", "?")
+            _tname = _t.get("function", {}).get("name") if _ttype == "function" else _t.get("name", "?")
+            verbose_proxy_logger.debug(
+                "Tool Permission Guardrail: inspecting tool type=%s name=%s", _ttype, _tname
+            )
+
         # Check permissions for each tool
         denied_tool_names = []
         for tool in new_tools:
-            if tool["type"] != "function":
-                continue
-            tool_name: str = tool["function"]["name"]
             tool_type: Optional[str] = tool.get("type")
+            # Handle both OpenAI format (type: "function", function.name)
+            # and Anthropic-native format (type: "bash_20250124", name: "bash")
+            if tool_type == "function":
+                tool_name: str = tool["function"]["name"]
+            elif "name" in tool:
+                # Anthropic-native tool (e.g. bash_20250124, text_editor_20250124)
+                tool_name = tool["name"]
+            else:
+                continue
 
             is_allowed, _, message = self._check_tool_permission(tool_name, tool_type)
 

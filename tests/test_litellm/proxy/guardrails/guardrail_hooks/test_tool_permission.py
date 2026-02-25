@@ -605,6 +605,198 @@ class TestToolPermissionGuardrailIntegration:
         )
         assert guardrail2.on_disallowed_action == "rewrite"
 
+    @pytest.mark.asyncio
+    async def test_async_pre_call_hook_blocks_anthropic_native_tools(self):
+        """Tool Permission Guardrail blocks Anthropic-native tools (e.g. bash_20250124)."""
+        guardrail = ToolPermissionGuardrail(
+            guardrail_name="block-all",
+            rules=[],
+            default_action="deny",
+            on_disallowed_action="block",
+        )
+
+        data = {
+            "tools": [
+                {"type": "bash_20250124", "name": "bash"},
+                {"type": "text_editor_20250124", "name": "text_editor"},
+            ]
+        }
+        user_api_key_dict = UserAPIKeyAuth()
+        cache = DualCache(default_in_memory_ttl=1)
+
+        with patch.object(guardrail, "should_run_guardrail", return_value=True):
+            with pytest.raises(HTTPException) as excinfo:
+                await guardrail.async_pre_call_hook(
+                    user_api_key_dict=user_api_key_dict,
+                    cache=cache,
+                    data=data,
+                    call_type="completion",
+                )
+        assert excinfo.value.status_code == 400
+        assert "bash" in str(excinfo.value.detail)
+
+    @pytest.mark.asyncio
+    async def test_async_pre_call_hook_allows_anthropic_native_tools_by_rule(self):
+        """Tool Permission Guardrail allows specific Anthropic-native tools via rules."""
+        guardrail = ToolPermissionGuardrail(
+            guardrail_name="allow-bash-only",
+            rules=[
+                {"id": "allow_bash", "tool_name": r"^bash$", "decision": "allow"},
+            ],
+            default_action="deny",
+            on_disallowed_action="block",
+        )
+
+        # Request with only the allowed tool
+        data = {
+            "tools": [
+                {"type": "bash_20250124", "name": "bash"},
+            ]
+        }
+        user_api_key_dict = UserAPIKeyAuth()
+        cache = DualCache(default_in_memory_ttl=1)
+
+        with patch.object(guardrail, "should_run_guardrail", return_value=True):
+            result = await guardrail.async_pre_call_hook(
+                user_api_key_dict=user_api_key_dict,
+                cache=cache,
+                data=data,
+                call_type="completion",
+            )
+        assert isinstance(result, dict)
+
+    @pytest.mark.asyncio
+    async def test_async_pre_call_hook_blocks_denied_anthropic_native_tool(self):
+        """Tool Permission Guardrail blocks denied Anthropic-native tool even when others are allowed."""
+        guardrail = ToolPermissionGuardrail(
+            guardrail_name="allow-bash-only",
+            rules=[
+                {"id": "allow_bash", "tool_name": r"^bash$", "decision": "allow"},
+            ],
+            default_action="deny",
+            on_disallowed_action="block",
+        )
+
+        # Request with allowed + denied tools
+        data = {
+            "tools": [
+                {"type": "bash_20250124", "name": "bash"},
+                {"type": "text_editor_20250124", "name": "text_editor"},
+            ]
+        }
+        user_api_key_dict = UserAPIKeyAuth()
+        cache = DualCache(default_in_memory_ttl=1)
+
+        with patch.object(guardrail, "should_run_guardrail", return_value=True):
+            with pytest.raises(HTTPException) as excinfo:
+                await guardrail.async_pre_call_hook(
+                    user_api_key_dict=user_api_key_dict,
+                    cache=cache,
+                    data=data,
+                    call_type="completion",
+                )
+        assert excinfo.value.status_code == 400
+        assert "text_editor" in str(excinfo.value.detail)
+
+    @pytest.mark.asyncio
+    async def test_async_pre_call_hook_mixed_openai_and_anthropic_tools(self):
+        """Tool Permission Guardrail checks both OpenAI and Anthropic-native tool formats."""
+        guardrail = ToolPermissionGuardrail(
+            guardrail_name="mixed-tools",
+            rules=[
+                {"id": "allow_bash", "tool_name": r"^bash$", "decision": "allow"},
+                {"id": "allow_weather", "tool_name": r"^get_weather$", "decision": "allow"},
+            ],
+            default_action="deny",
+            on_disallowed_action="block",
+        )
+
+        # Mix of Anthropic-native and OpenAI-format tools, all allowed
+        data = {
+            "tools": [
+                {"type": "bash_20250124", "name": "bash"},
+                {"type": "function", "function": {"name": "get_weather", "description": "Get weather", "parameters": {"type": "object", "properties": {}}}},
+            ]
+        }
+        user_api_key_dict = UserAPIKeyAuth()
+        cache = DualCache(default_in_memory_ttl=1)
+
+        with patch.object(guardrail, "should_run_guardrail", return_value=True):
+            result = await guardrail.async_pre_call_hook(
+                user_api_key_dict=user_api_key_dict,
+                cache=cache,
+                data=data,
+                call_type="completion",
+            )
+        assert isinstance(result, dict)
+
+    @pytest.mark.asyncio
+    async def test_async_pre_call_hook_rewrite_mode_anthropic_native_tools(self):
+        """Rewrite mode removes denied Anthropic-native tools from request."""
+        guardrail = ToolPermissionGuardrail(
+            guardrail_name="rewrite-native",
+            rules=[
+                {"id": "allow_bash", "tool_name": r"^bash$", "decision": "allow"},
+            ],
+            default_action="deny",
+            on_disallowed_action="rewrite",
+        )
+
+        data = {
+            "tools": [
+                {"type": "bash_20250124", "name": "bash"},
+                {"type": "text_editor_20250124", "name": "text_editor"},
+                {"type": "web_search_20250305", "name": "web_search"},
+            ]
+        }
+        user_api_key_dict = UserAPIKeyAuth()
+        cache = DualCache(default_in_memory_ttl=1)
+
+        with patch.object(guardrail, "should_run_guardrail", return_value=True):
+            new_data = await guardrail.async_pre_call_hook(
+                user_api_key_dict=user_api_key_dict,
+                cache=cache,
+                data=data,
+                call_type="completion",
+            )
+
+        assert isinstance(new_data, dict)
+        assert "tools" in new_data
+        # Only bash should remain
+        tool_names = [t["name"] for t in new_data["tools"] if "name" in t]
+        assert "bash" in tool_names
+        assert "text_editor" not in tool_names
+        assert "web_search" not in tool_names
+
+    @pytest.mark.asyncio
+    async def test_async_pre_call_hook_web_search_tool(self):
+        """Tool Permission Guardrail handles web_search_20250305 tool type."""
+        guardrail = ToolPermissionGuardrail(
+            guardrail_name="block-all",
+            rules=[],
+            default_action="deny",
+            on_disallowed_action="block",
+        )
+
+        data = {
+            "tools": [
+                {"type": "web_search_20250305", "name": "web_search"},
+            ]
+        }
+        user_api_key_dict = UserAPIKeyAuth()
+        cache = DualCache(default_in_memory_ttl=1)
+
+        with patch.object(guardrail, "should_run_guardrail", return_value=True):
+            with pytest.raises(HTTPException) as excinfo:
+                await guardrail.async_pre_call_hook(
+                    user_api_key_dict=user_api_key_dict,
+                    cache=cache,
+                    data=data,
+                    call_type="completion",
+                )
+        assert excinfo.value.status_code == 400
+        assert "web_search" in str(excinfo.value.detail)
+
     def test_case_insensitive_decision_in_rules(self):
         """Test that decision field in rules accepts capitalized values and normalizes them"""
         guardrail = ToolPermissionGuardrail(

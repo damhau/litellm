@@ -11,6 +11,7 @@ from typing import Any, List, Literal, Optional
 from unittest.mock import MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
 
 sys.path.insert(
     0, os.path.abspath("../../../../../../..")
@@ -60,6 +61,83 @@ class MockToolRemovingGuardrail(CustomGuardrail):
                 if isinstance(t, dict)
                 and t.get("function", {}).get("name") not in self.tools_to_remove
             ]
+        return inputs
+
+
+class MockBlockingGuardrail(CustomGuardrail):
+    """Mock guardrail that blocks requests containing specific keywords."""
+
+    def __init__(self, guardrail_name: str, blocked_keywords: List[str]):
+        super().__init__(guardrail_name=guardrail_name)
+        self.blocked_keywords = blocked_keywords
+
+    async def apply_guardrail(
+        self,
+        inputs: GenericGuardrailAPIInputs,
+        request_data: dict,
+        input_type: Literal["request", "response"],
+        logging_obj: Optional[Any] = None,
+    ) -> GenericGuardrailAPIInputs:
+        """Block request if any text contains a blocked keyword."""
+        texts = inputs.get("texts", [])
+        for text in texts:
+            for keyword in self.blocked_keywords:
+                if keyword.lower() in text.lower():
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "error": f"Content blocked by guardrail: contains '{keyword}'",
+                            "type": "content_policy_violation",
+                        },
+                    )
+        return inputs
+
+
+class MockTextModifyingGuardrail(CustomGuardrail):
+    """Mock guardrail that redacts PII-like patterns from text."""
+
+    def __init__(self, guardrail_name: str, redact_map: dict):
+        super().__init__(guardrail_name=guardrail_name)
+        self.redact_map = redact_map
+
+    async def apply_guardrail(
+        self,
+        inputs: GenericGuardrailAPIInputs,
+        request_data: dict,
+        input_type: Literal["request", "response"],
+        logging_obj: Optional[Any] = None,
+    ) -> GenericGuardrailAPIInputs:
+        """Replace sensitive patterns in texts."""
+        texts = inputs.get("texts", [])
+        modified_texts = []
+        for text in texts:
+            for pattern, replacement in self.redact_map.items():
+                text = text.replace(pattern, replacement)
+            modified_texts.append(text)
+        inputs["texts"] = modified_texts
+        return inputs
+
+
+class MockRecordingGuardrail(CustomGuardrail):
+    """Mock guardrail that records what it received for inspection."""
+
+    def __init__(self, guardrail_name: str):
+        super().__init__(guardrail_name=guardrail_name)
+        self.received_inputs: Optional[GenericGuardrailAPIInputs] = None
+        self.received_request_data: Optional[dict] = None
+        self.call_count: int = 0
+
+    async def apply_guardrail(
+        self,
+        inputs: GenericGuardrailAPIInputs,
+        request_data: dict,
+        input_type: Literal["request", "response"],
+        logging_obj: Optional[Any] = None,
+    ) -> GenericGuardrailAPIInputs:
+        """Record inputs for later assertion."""
+        self.received_inputs = inputs
+        self.received_request_data = request_data
+        self.call_count += 1
         return inputs
 
 
@@ -519,6 +597,307 @@ class TestAnthropicToolFormatPreservation:
         assert len(tools) == 1
         assert tools[0]["type"] == "web_search_20250305"
         assert tools[0]["name"] == "web_search"
+
+
+class TestGuardrailsAreActuallyApplied:
+    """Regression tests: verify guardrails are truly invoked and their effects are visible.
+
+    These tests cover the concern that after the tool-reconciliation fix,
+    guardrails might appear to be "not applied anymore."
+    """
+
+    @pytest.mark.asyncio
+    async def test_blocking_guardrail_raises_exception(self):
+        """A guardrail that raises HTTPException must still block the request."""
+        handler = AnthropicMessagesHandler()
+        guardrail = MockBlockingGuardrail(
+            guardrail_name="blocker", blocked_keywords=["secret"]
+        )
+
+        data = {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Tell me the secret password"}],
+            "tools": [
+                {"type": "bash_20250124", "name": "bash"},
+            ],
+        }
+
+        with patch.dict(sys.modules, {"litellm.proxy.proxy_server": _mock_proxy_server()}):
+            with pytest.raises(HTTPException) as exc_info:
+                await handler.process_input_messages(
+                    data=data, guardrail_to_apply=guardrail
+                )
+            assert exc_info.value.status_code == 400
+            assert "secret" in str(exc_info.value.detail)
+
+    @pytest.mark.asyncio
+    async def test_blocking_guardrail_allows_clean_request(self):
+        """A blocking guardrail should let clean requests through."""
+        handler = AnthropicMessagesHandler()
+        guardrail = MockBlockingGuardrail(
+            guardrail_name="blocker", blocked_keywords=["secret"]
+        )
+
+        data = {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "What is the weather today?"}],
+            "tools": [
+                {"type": "bash_20250124", "name": "bash"},
+            ],
+        }
+
+        with patch.dict(sys.modules, {"litellm.proxy.proxy_server": _mock_proxy_server()}):
+            result = await handler.process_input_messages(
+                data=data, guardrail_to_apply=guardrail
+            )
+
+        # Request should pass through
+        assert result["messages"][0]["content"] == "What is the weather today?"
+        # Tools should remain in Anthropic format
+        assert result["tools"][0]["type"] == "bash_20250124"
+
+    @pytest.mark.asyncio
+    async def test_text_modifying_guardrail_changes_message_content(self):
+        """A guardrail that modifies text must have its changes reflected in messages."""
+        handler = AnthropicMessagesHandler()
+        guardrail = MockTextModifyingGuardrail(
+            guardrail_name="pii-redactor",
+            redact_map={
+                "John Smith": "[REDACTED_NAME]",
+                "555-1234": "[REDACTED_PHONE]",
+            },
+        )
+
+        data = {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": "Call John Smith at 555-1234"},
+            ],
+        }
+
+        with patch.dict(sys.modules, {"litellm.proxy.proxy_server": _mock_proxy_server()}):
+            result = await handler.process_input_messages(
+                data=data, guardrail_to_apply=guardrail
+            )
+
+        # Text modifications must be applied
+        assert result["messages"][0]["content"] == "Call [REDACTED_NAME] at [REDACTED_PHONE]"
+
+    @pytest.mark.asyncio
+    async def test_text_modifying_guardrail_with_native_tools(self):
+        """Text modifications work correctly alongside Anthropic-native tools."""
+        handler = AnthropicMessagesHandler()
+        guardrail = MockTextModifyingGuardrail(
+            guardrail_name="pii-redactor",
+            redact_map={"password123": "[REDACTED]"},
+        )
+
+        data = {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": "My password is password123"},
+            ],
+            "tools": [
+                {"type": "bash_20250124", "name": "bash"},
+                {"type": "text_editor_20250124", "name": "text_editor"},
+            ],
+        }
+
+        with patch.dict(sys.modules, {"litellm.proxy.proxy_server": _mock_proxy_server()}):
+            result = await handler.process_input_messages(
+                data=data, guardrail_to_apply=guardrail
+            )
+
+        # Text must be modified
+        assert result["messages"][0]["content"] == "My password is [REDACTED]"
+        # Tools must remain in Anthropic format
+        assert len(result["tools"]) == 2
+        assert result["tools"][0]["type"] == "bash_20250124"
+        assert result["tools"][1]["type"] == "text_editor_20250124"
+
+    @pytest.mark.asyncio
+    async def test_guardrail_is_actually_called(self):
+        """Verify the guardrail's apply_guardrail method is invoked."""
+        handler = AnthropicMessagesHandler()
+        guardrail = MockRecordingGuardrail(guardrail_name="recorder")
+
+        data = {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "hello world"}],
+            "tools": [
+                {"type": "bash_20250124", "name": "bash"},
+            ],
+        }
+
+        with patch.dict(sys.modules, {"litellm.proxy.proxy_server": _mock_proxy_server()}):
+            await handler.process_input_messages(
+                data=data, guardrail_to_apply=guardrail
+            )
+
+        # Guardrail must have been called exactly once
+        assert guardrail.call_count == 1
+        # Guardrail must have received the text content
+        assert guardrail.received_inputs is not None
+        assert "hello world" in guardrail.received_inputs.get("texts", [])
+        # Guardrail must have received tools in OpenAI format for inspection
+        tools = guardrail.received_inputs.get("tools", [])
+        assert len(tools) == 1
+        assert tools[0]["type"] == "function"
+        assert tools[0]["function"]["name"] == "bash"
+
+    @pytest.mark.asyncio
+    async def test_guardrail_receives_all_message_texts(self):
+        """Guardrail receives text from all messages in the conversation."""
+        handler = AnthropicMessagesHandler()
+        guardrail = MockRecordingGuardrail(guardrail_name="recorder")
+
+        data = {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": "first message"},
+                {"role": "assistant", "content": "response"},
+                {"role": "user", "content": "second message"},
+            ],
+        }
+
+        with patch.dict(sys.modules, {"litellm.proxy.proxy_server": _mock_proxy_server()}):
+            await handler.process_input_messages(
+                data=data, guardrail_to_apply=guardrail
+            )
+
+        texts = guardrail.received_inputs.get("texts", [])
+        assert "first message" in texts
+        assert "response" in texts
+        assert "second message" in texts
+
+    @pytest.mark.asyncio
+    async def test_text_modifying_guardrail_with_multimodal_content(self):
+        """Text modifications work with list-format content (multimodal messages)."""
+        handler = AnthropicMessagesHandler()
+        guardrail = MockTextModifyingGuardrail(
+            guardrail_name="redactor",
+            redact_map={"sensitive_data": "[REDACTED]"},
+        )
+
+        data = {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1024,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Here is sensitive_data for you"},
+                        {"type": "text", "text": "More sensitive_data here"},
+                    ],
+                },
+            ],
+        }
+
+        with patch.dict(sys.modules, {"litellm.proxy.proxy_server": _mock_proxy_server()}):
+            result = await handler.process_input_messages(
+                data=data, guardrail_to_apply=guardrail
+            )
+
+        content = result["messages"][0]["content"]
+        assert content[0]["text"] == "Here is [REDACTED] for you"
+        assert content[1]["text"] == "More [REDACTED] here"
+
+    @pytest.mark.asyncio
+    async def test_blocking_guardrail_with_multimodal_content(self):
+        """Blocking guardrail works with list-format content."""
+        handler = AnthropicMessagesHandler()
+        guardrail = MockBlockingGuardrail(
+            guardrail_name="blocker", blocked_keywords=["forbidden"]
+        )
+
+        data = {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1024,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "This contains forbidden content"},
+                    ],
+                },
+            ],
+        }
+
+        with patch.dict(sys.modules, {"litellm.proxy.proxy_server": _mock_proxy_server()}):
+            with pytest.raises(HTTPException) as exc_info:
+                await handler.process_input_messages(
+                    data=data, guardrail_to_apply=guardrail
+                )
+            assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_no_messages_skips_guardrail(self):
+        """When there are no messages, guardrail is not called."""
+        handler = AnthropicMessagesHandler()
+        guardrail = MockRecordingGuardrail(guardrail_name="recorder")
+
+        data = {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1024,
+        }
+
+        with patch.dict(sys.modules, {"litellm.proxy.proxy_server": _mock_proxy_server()}):
+            result = await handler.process_input_messages(
+                data=data, guardrail_to_apply=guardrail
+            )
+
+        assert guardrail.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_tool_removal_and_text_modification_combined(self):
+        """Tool removal by guardrail works alongside text being preserved."""
+        handler = AnthropicMessagesHandler()
+
+        # Create a guardrail that both removes tools and modifies texts
+        class CombinedGuardrail(CustomGuardrail):
+            async def apply_guardrail(self, inputs, request_data, input_type, logging_obj=None):
+                # Remove bash tool
+                tools = inputs.get("tools")
+                if tools is not None:
+                    inputs["tools"] = [
+                        t for t in tools
+                        if isinstance(t, dict)
+                        and t.get("function", {}).get("name") != "bash"
+                    ]
+                # Modify text
+                texts = inputs.get("texts", [])
+                inputs["texts"] = [t.upper() for t in texts]
+                return inputs
+
+        guardrail = CombinedGuardrail(guardrail_name="combined")
+
+        data = {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "hello world"}],
+            "tools": [
+                {"type": "bash_20250124", "name": "bash"},
+                {"type": "text_editor_20250124", "name": "text_editor"},
+            ],
+        }
+
+        with patch.dict(sys.modules, {"litellm.proxy.proxy_server": _mock_proxy_server()}):
+            result = await handler.process_input_messages(
+                data=data, guardrail_to_apply=guardrail
+            )
+
+        # Text must be uppercased
+        assert result["messages"][0]["content"] == "HELLO WORLD"
+        # Only text_editor should remain, in Anthropic format
+        assert len(result["tools"]) == 1
+        assert result["tools"][0]["type"] == "text_editor_20250124"
+        assert result["tools"][0]["name"] == "text_editor"
 
 
 if __name__ == "__main__":
