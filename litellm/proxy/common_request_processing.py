@@ -211,6 +211,17 @@ async def create_response(
             headers=headers,
             status_code=default_status_code,
         )
+    except HTTPException as e:
+        # Guardrail or known HTTP error while consuming stream.
+        verbose_proxy_logger.warning(
+            f"HTTPException consuming first chunk from generator: {e.status_code}: {e.detail}"
+        )
+        error_detail = e.detail if isinstance(e.detail, dict) else {"message": str(e.detail)}
+        return JSONResponse(
+            status_code=e.status_code,
+            content={"error": error_detail},
+            headers=headers,
+        )
     except Exception as e:
         # Unexpected error consuming first chunk.
         verbose_proxy_logger.exception(

@@ -1,22 +1,22 @@
 model_list:
-  - model_name: claude-sonnet-4-20250514
+  - model_name: anthropic/*
     litellm_params:
-      model: anthropic/claude-sonnet-4-20250514
+      model: anthropic/*
+      api_key: os.environ/ANTHROPIC_API_KEY
 
 guardrails:
-  - guardrail_name: "control-bash-commands"
+
+  - guardrail_name: "external-tool-evaluator"
     litellm_params:
-      guardrail: tool_permission
+      guardrail: external_hook_evaluate.ExternalHookEvaluateGuardrail
       mode: post_call
       default_on: true
-      default_action: "allow"
-      on_disallowed_action: "block"
-      rules:
-        - id: "block_docker_push"
-          tool_name: "^Bash$"
-          decision: "deny"
-          allowed_param_patterns:
-            command: ".*\\bdocker\\s+push\\b.*"
+      api_base: "http://localhost:8000"
+      api_key: "veto_2REJ31PCnoPwQB0GkgsJonoLwro6xAA1T5S0O2nfcuE"
+
+environment_variables:
+  UI_USERNAME: "admin"
+  UI_PASSWORD: "admin"
 
 general_settings:
   master_key: sk-test-master-key
