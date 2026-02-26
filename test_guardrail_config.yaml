@@ -12,7 +12,7 @@ guardrails:
       mode: post_call
       default_on: true
       api_base: "http://localhost:8000"
-      api_key: "veto_xxx"
+      api_key: ""
 
 environment_variables:
   UI_USERNAME: "admin"
