@@ -52,6 +52,11 @@ jobs:
         run: |
           git merge upstream/main --no-edit
 
+      - name: Remove upstream workflows
+        if: steps.check_tag.outputs.exists == 'false'
+        run: |
+          find .github/workflows -type f | grep -v -E '/(docker-build-push|sync-upstream)\.yml$' | xargs git rm -f --ignore-unmatch
+
       - name: Apply custom patches
         if: steps.check_tag.outputs.exists == 'false'
         run: |
