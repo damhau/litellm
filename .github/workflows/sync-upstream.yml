@@ -1,0 +1,68 @@
+name: Sync Upstream and Build
+
+on:
+  schedule:
+    - cron: "0 6 * * *"  # daily at 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "Damien Hauser"
+          git config user.email "damien.hauser@gmail.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/BerriAI/litellm.git
+          git fetch upstream --tags
+
+      - name: Get latest upstream tag
+        id: upstream_tag
+        run: |
+          TAG=$(git tag --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream stable tag: $TAG"
+
+      - name: Check if tag already exists in fork
+        id: check_tag
+        run: |
+          TAG=${{ steps.upstream_tag.outputs.tag }}
+          if git ls-remote --tags origin "refs/tags/$TAG" | grep -q "$TAG"; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Tag $TAG already exists, nothing to do."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Tag $TAG is new, proceeding."
+          fi
+
+      - name: Merge upstream main
+        if: steps.check_tag.outputs.exists == 'false'
+        run: |
+          git merge upstream/main --no-edit
+
+      - name: Apply custom patches
+        if: steps.check_tag.outputs.exists == 'false'
+        run: |
+          git apply --3way patches/remove-premium-checks.patch
+          git add -A
+          git commit -m "Apply custom patches on top of ${{ steps.upstream_tag.outputs.tag }}" || echo "Nothing to commit"
+
+      - name: Tag and push
+        if: steps.check_tag.outputs.exists == 'false'
+        run: |
+          TAG=${{ steps.upstream_tag.outputs.tag }}
+          git tag "$TAG"
+          git push origin main
+          git push origin "$TAG"
