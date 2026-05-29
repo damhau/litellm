@@ -1,0 +1,50 @@
+  name: Build Patched Image (choose upstream tag)
+
+  on:
+    workflow_dispatch:
+      inputs:
+        upstream_tag:
+          description: "Upstream LiteLLM tag to build (e.g. v1.88.0-dev.1)"
+          required: true
+
+  jobs:
+    build-and-push:
+      runs-on: ubuntu-latest
+      steps:
+        - name: Checkout fork (for the patch file)
+          uses: actions/checkout@v4
+
+        - name: Check out pristine upstream tag + apply patch
+          env:
+            TAG: ${{ github.event.inputs.upstream_tag }}
+          run: |
+            git config user.name "Damien Hauser"
+            git config user.email "damien.hauser@gmail.com"
+            # Keep the patch from the fork before we switch trees
+            cp patches/remove-premium-checks.patch /tmp/patch.diff
+            # Fetch ONLY the chosen tag into a non-colliding ref
+            git remote add upstream https://github.com/BerriAI/litellm.git
+            git fetch upstream --no-tags "+refs/tags/${TAG}:refs/upstream-tags/${TAG}"
+            # Pristine upstream tree at that tag (detached)
+            git checkout -f "refs/upstream-tags/${TAG}"
+            # Apply your patch on top of upstream's exact release
+            git apply --3way /tmp/patch.diff
+            echo "Built tree = upstream ${TAG} + remove-premium-checks.patch"
+
+        - name: Set up Docker Buildx
+          uses: docker/setup-buildx-action@v3
+
+        - name: Log in to Docker Hub
+          uses: docker/login-action@v3
+          with:
+            username: ${{ secrets.DOCKERHUB_USERNAME }}
+            password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+        - name: Build and push
+          uses: docker/build-push-action@v6
+          with:
+            context: .
+            push: true
+            tags: docker.io/damienh/veto-litellm-teams:${{ github.event.inputs.upstream_tag }}
+            cache-from: type=gha
+            cache-to: type=gha,mode=max
