@@ -42,16 +42,25 @@ jobs:
         env:
           TAG: ${{ steps.check.outputs.tag }}
         run: |
-          git merge upstream/main --no-edit
+          # Don't abort on conflicts — we resolve the workflow ones below.
+          git merge upstream/main --no-edit || echo "Merge had conflicts, resolving…"
 
+          # Delete every workflow we don't keep. For modify/delete conflicts this
+          # stages the deletion and clears the conflict.
           find .github/workflows -type f \
             | grep -v -E '/(docker-build-push|sync-upstream)\.yml$' \
-            | xargs git rm -f --ignore-unmatch
+            | xargs -r git rm -f --ignore-unmatch
+
+          # Bail if any OTHER conflict is still unresolved (don't commit broken code).
+          if git ls-files -u | grep -q .; then
+            echo "::error::Unresolved merge conflicts remain:"
+            git ls-files -u | awk '{print $4}' | sort -u
+            exit 1
+          fi
 
           git apply --3way patches/remove-premium-checks.patch
           git add -A
           git commit -m "Sync upstream $TAG + apply custom patches"
-
           git tag "$TAG"
           git push origin main
           git push origin "$TAG"
